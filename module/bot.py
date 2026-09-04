@@ -37,6 +37,7 @@ from module.pyrogram_extension import (
     set_meta_data,
     upload_telegram_chat_message,
 )
+from module.url_downloader import register_url_downloader
 from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
@@ -225,20 +226,22 @@ class DownloadBot:
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
-        self.bot.add_handler(
-            MessageHandler(
-                download_forward_media,
-                filters=pyrogram.filters.media
-                & pyrogram.filters.user(self.allowed_user_ids),
+        if not (self.app.config or {}).get("url_downloader", {}).get("enabled"):
+            self.bot.add_handler(
+                MessageHandler(
+                    download_forward_media,
+                    filters=pyrogram.filters.media
+                    & pyrogram.filters.user(self.allowed_user_ids),
+                )
             )
-        )
-        self.bot.add_handler(
-            MessageHandler(
-                download_from_link,
-                filters=pyrogram.filters.regex(r"^https://t.me.*")
-                & pyrogram.filters.user(self.allowed_user_ids),
+        if not (self.app.config or {}).get("url_downloader", {}).get("enabled"):
+            self.bot.add_handler(
+                MessageHandler(
+                    download_from_link,
+                    filters=pyrogram.filters.regex(r"^https://t.me.*")
+                    & pyrogram.filters.user(self.allowed_user_ids),
+                )
             )
-        )
         self.bot.add_handler(
             MessageHandler(
                 set_listen_forward_msg,
@@ -310,6 +313,19 @@ class DownloadBot:
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
+
+        url_cfg = (self.app.config or {}).get("url_downloader") or {}
+        if url_cfg.get("enabled"):
+            try:
+                register_url_downloader(
+                    self.app,
+                    self.bot,
+                    self.client,
+                    url_cfg,
+                    self.allowed_user_ids,
+                )
+            except Exception as e:
+                logger.warning(f"register url_downloader error: {e}")
 
 
 _bot = DownloadBot()
