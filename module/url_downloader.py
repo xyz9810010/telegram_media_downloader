@@ -35,7 +35,7 @@ from loguru import logger
 import pyrogram
 from pyrogram import filters
 from pyrogram import types
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 
 from module.pyrogram_extension import parse_link, retry
@@ -360,6 +360,7 @@ class UrlDownloader:
         self.cancel_watch_tasks = {}
         self.cancel_results = {}
         self.progress_cache = {}
+        self.status_body = {}
         self.flood_until = {}
         self.status_edit_locks = {}
         self.user_locks = {}
@@ -459,6 +460,7 @@ class UrlDownloader:
         self.cancel_watch_tasks.clear()
         self.cancel_results.clear()
         self.progress_cache.clear()
+        self.status_body.clear()
         self.flood_until.clear()
         self.status_edit_locks.clear()
         self.deadlines.clear()
@@ -2528,6 +2530,7 @@ class UrlDownloader:
             await self._edit_status(session, text)
             self.sessions.pop(token, None)
             self.status_edit_locks.pop(token, None)
+            self.status_body.pop(token, None)
             shutil.rmtree(os.path.join(self.tmp_root, token), ignore_errors=True)
 
     async def _edit_status(self, session, text):
@@ -2554,6 +2557,8 @@ class UrlDownloader:
                     await self.bot.edit_message_text(cache[0], cache[1], text)
                 else:
                     await status.edit_text(text)
+                return True
+            except MessageNotModified:
                 return True
             except FloodWait as exc:
                 # 仍被限流 → 记录冷却；下面的补发前还会再等一次
@@ -2605,10 +2610,15 @@ class UrlDownloader:
                 return
             self.progress_cache[token] = (chat_id, msg_id, -1.0, now)
             markup = self._cancel_markup(token) if cancellable else None
+            if self.status_body.get(token) == text:
+                return
             try:
                 await self.bot.edit_message_text(
                     chat_id, msg_id, text, reply_markup=markup
                 )
+                self.status_body[token] = text
+            except MessageNotModified:
+                self.status_body[token] = text
             except FloodWait as exc:
                 # 限流窗口内不要补发新消息，等冷却后的下一次更新即可
                 self._note_flood(chat_id, getattr(exc, "value", 0.0))
@@ -2627,6 +2637,7 @@ class UrlDownloader:
                     self.progress_cache[token] = (
                         chat_id, msg.id, -1.0, time.monotonic()
                     )
+                    self.status_body[token] = text
                     session = self.sessions.get(token)
                     if session is not None:
                         session["status_msg"] = msg
@@ -2826,6 +2837,7 @@ class UrlDownloader:
             ):
                 self.cancel_results.pop(token, None)
             self.progress_cache.pop(token, None)
+            self.status_body.pop(token, None)
             shutil.rmtree(os.path.join(self.tmp_root, token), ignore_errors=True)
             self.sessions.pop(token, None)
             self.status_edit_locks.pop(token, None)
@@ -3146,6 +3158,7 @@ class UrlDownloader:
         cache = self.progress_cache.get(token)
         if cache:
             self.progress_cache[token] = (cache[0], cache[1], -1.0, 0.0)
+            self.status_body.pop(token, None)
 
     async def _report(
         self,
@@ -3204,6 +3217,10 @@ class UrlDownloader:
                     lines.extend(extra[1].split("\n"))
             markup = self._cancel_markup(token) if cancellable else None
             body = "\n".join(lines)
+            if self.status_body.get(token) == body:
+                # 内容没变化就不再发请求：Telegram 会回 MESSAGE_NOT_MODIFIED，
+                # 旧逻辑“补发一条”会不断复制出重复进度卡并最终触发限流
+                return
             try:
                 await self.bot.edit_message_text(
                     chat_id,
@@ -3211,6 +3228,10 @@ class UrlDownloader:
                     body,
                     reply_markup=markup,
                 )
+                self.status_body[token] = body
+            except MessageNotModified:
+                # 与当前显示内容一致，视为已更新，不要补发
+                self.status_body[token] = body
             except FloodWait as exc:
                 self._note_flood(chat_id, getattr(exc, "value", 0.0))
             except Exception as exc:  # noqa: BLE001
@@ -3228,6 +3249,7 @@ class UrlDownloader:
                     self.progress_cache[token] = (
                         chat_id, msg.id, pct, time.monotonic()
                     )
+                    self.status_body[token] = body
                     if session is not None:
                         session["status_msg"] = msg
                 except FloodWait as send_exc:

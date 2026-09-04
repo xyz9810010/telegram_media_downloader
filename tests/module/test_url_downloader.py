@@ -6,7 +6,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 
 from module import url_downloader as url_mod
 from module.url_downloader import UrlDownloader
@@ -137,6 +137,27 @@ class _FloodOnceBot:
         self.sends += 1
         self.visible_text["send:" + str(self.sends)] = text
         return _Message(self, 100, 100 + self.sends)
+
+
+class _NotModifiedBot:
+    """edit_message_text always answers MESSAGE_NOT_MODIFIED."""
+
+    def __init__(self):
+        self.edits = 0
+        self.sends = 0
+
+    async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+        del chat_id, message_id, text, kwargs
+        self.edits += 1
+        raise MessageNotModified(
+            'Telegram says: [400 MESSAGE_NOT_MODIFIED] - '
+            'The message was not modified (caused by "messages.EditMessage")'
+        )
+
+    async def send_message(self, chat_id, text, **kwargs):
+        del chat_id, text, kwargs
+        self.sends += 1
+        raise AssertionError("fallback send must not run for MESSAGE_NOT_MODIFIED")
 
 
 class _UnavailableSemaphore:
@@ -369,6 +390,45 @@ class UrlDownloaderProgressTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(t == "saved successfully" for t in bot.visible_text.values())
         )
+
+    async def test_report_unchanged_body_skips_request(self):
+        """Repeated reports with identical text do not hit the API again."""
+        bot = _RecordingBot()
+        downloader, token, _ = self._downloader(bot)
+        downloader.progress_cache[token] = (
+            100, 1, -1.0, time.monotonic() - 5.0
+        )
+
+        await downloader._report(
+            token, 30, done_s="3MB", total_s="10MB", label="progress"
+        )
+        self.assertEqual(1, bot.edits)
+        downloader.progress_cache[token] = (
+            100, 1, 30.0, time.monotonic() - 5.0
+        )
+        await downloader._report(
+            token, 30, done_s="3MB", total_s="10MB", label="progress"
+        )
+        self.assertEqual(1, bot.edits)
+
+    async def test_report_message_not_modified_is_benign(self):
+        """MESSAGE_NOT_MODIFIED must not trigger the duplicate fallback send."""
+        bot = _NotModifiedBot()
+        downloader, token, _ = self._downloader(bot)
+
+        await downloader._report(
+            token, 30, done_s="3MB", total_s="10MB", label="progress"
+        )
+        self.assertEqual(1, bot.edits)
+        self.assertEqual(0, bot.sends)
+
+    async def test_edit_status_message_not_modified_returns_success(self):
+        """A final status already on screen counts as delivered."""
+        bot = _NotModifiedBot()
+        downloader, token, session = self._downloader(bot)
+
+        self.assertTrue(await downloader._edit_status(session, "saved successfully"))
+        self.assertEqual(0, bot.sends)
 
 
 if __name__ == "__main__":
