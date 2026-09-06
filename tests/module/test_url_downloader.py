@@ -1,6 +1,9 @@
 """Regression tests for URL downloader progress reporting."""
 
 import asyncio
+import os
+import shutil
+import tempfile
 import threading
 import time
 import unittest
@@ -617,6 +620,115 @@ class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["folder"], new_session["folder"])
         self.assertEqual([10], [m.id for m in new_session["media_msgs"]])
         self.assertTrue(new_session["multi"])
+
+
+class UrlDownloaderPipelineTest(unittest.IsolatedAsyncioTestCase):
+    """The batch download/upload legs must overlap without losing files."""
+
+    async def _downloader_with_fakes(self, n_items, dl_secs, up_secs):
+        downloader = UrlDownloader()
+        downloader.tmp_root = tempfile.mkdtemp(prefix="urldl-pipe-")
+        self.addCleanup(shutil.rmtree, downloader.tmp_root, True)
+        state = {"dl": 0, "up": 0, "max": 0}
+
+        async def fake_list_files(rel=""):
+            del rel
+            return {"a.jpg"}
+
+        async def fake_download_tg(
+            token, session, event, status, sub_dir=""
+        ):
+            del token, event, status
+            i = session.get("cur_i") or 1
+            state["dl"] += 1
+            state["max"] = max(state["max"], state["dl"] + state["up"])
+            item_dir = os.path.join(
+                downloader.tmp_root, "pipe", sub_dir or ""
+            )
+            os.makedirs(item_dir, exist_ok=True)
+            path = os.path.join(item_dir, "a.jpg")
+            with open(path, "wb") as fh:
+                fh.write(b"x" * 8)
+            try:
+                await asyncio.sleep(dl_secs)
+            finally:
+                state["dl"] -= 1
+            return path, "a.jpg", 8
+
+        async def fake_move_to_nas(local_path, rel="", token=None, seq=""):
+            del rel, token, seq
+            state["up"] += 1
+            state["max"] = max(state["max"], state["dl"] + state["up"])
+            try:
+                await asyncio.sleep(up_secs)
+            finally:
+                state["up"] -= 1
+            # rclone move 成功后会删掉本地源文件
+            os.remove(local_path)
+
+        downloader._list_files = fake_list_files
+        downloader._download_tg = fake_download_tg
+        downloader._move_to_nas = fake_move_to_nas
+
+        msgs = []
+        for mid in range(1, n_items + 1):
+            media = SimpleNamespace(
+                value="photo", file_name=None, file_size=8
+            )
+            m = SimpleNamespace(
+                id=mid,
+                from_user=SimpleNamespace(id=777),
+                chat=SimpleNamespace(id=-100),
+                media=media,
+            )
+            m.photo = media
+            msgs.append(m)
+        session = {
+            "token": "pipe",
+            "user_id": 777,
+            "chat_id": -100,
+            "kind": "tg",
+            "tg_msg": msgs[0],
+            "title": "批量媒体",
+            "size": 8 * n_items,
+            "multi": True,
+            "media_msgs": msgs,
+            "folder": "旅行",
+            "started": True,
+        }
+        return downloader, session, state
+
+    async def test_upload_overlaps_next_download_and_renames_in_order(self):
+        downloader, session, state = await self._downloader_with_fakes(
+            4, dl_secs=0.05, up_secs=0.25
+        )
+
+        await downloader._download_multi("pipe", session, asyncio.Event())
+
+        # 目标目录原本有 a.jpg，四个同名文件应依次自动改成 _1.._4
+        self.assertEqual(4, session["multi_done"])
+        # 上传(i) 与 下载(i+1) 曾经同时进行
+        self.assertGreaterEqual(state["max"], 2)
+
+    async def test_pipeline_saves_every_file_with_unique_names(self):
+        downloader, session, _ = await self._downloader_with_fakes(
+            4, dl_secs=0.02, up_secs=0.1
+        )
+        results_holder = {}
+
+        async def fake_edit_status(session, text):
+            del session
+            results_holder["text"] = text
+
+        downloader._edit_status = fake_edit_status
+
+        await downloader._download_multi("pipe", session, asyncio.Event())
+
+        text = results_holder["text"]
+        self.assertIn("已保存 4/4 个文件", text)
+        pos = [text.index(suffix) for suffix in
+               ("a_1.jpg", "a_2.jpg", "a_3.jpg", "a_4.jpg")]
+        self.assertEqual(pos, sorted(pos))
 
 
 if __name__ == "__main__":

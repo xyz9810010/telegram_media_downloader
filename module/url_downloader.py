@@ -3228,9 +3228,17 @@ class UrlDownloader:
         return final_path, os.path.basename(final_path), os.path.getsize(final_path)
 
     async def _download_tg(
-        self, token, session, event, status, tg_msg_override=None
+        self,
+        token,
+        session,
+        event,
+        status,
+        tg_msg_override=None,
+        sub_dir="",
     ):
         tmp_dir = os.path.join(self.tmp_root, token)
+        if sub_dir:
+            tmp_dir = os.path.join(tmp_dir, sub_dir)
         os.makedirs(tmp_dir, exist_ok=True)
         last = {"t": 0.0, "b": 0, "pct": 0.0, "speed": 0.0, "primed": False}
         tg_msg = tg_msg_override or session.get("tg_msg")
@@ -3436,10 +3444,12 @@ class UrlDownloader:
                     )
 
     async def _download_multi(self, token, session, event):
-        """Download several forwarded media one by one to the chosen folder.
+        """Download a batch to the chosen folder with a download/upload pipeline.
 
-        Every item is downloaded -> auto-renamed on NAS collision -> uploaded
-        immediately, so the temp dir never holds the whole batch at once.
+        The NAS upload of item i runs while item i+1 is downloading, so the
+        two slow legs overlap instead of idling each other. Uploads stay
+        serialized and in order; every file is auto-renamed (_1/_2) on NAS
+        name collision, and the temp dir never holds more than ~2 files.
         """
         msgs = sorted(
             (session.get("media_msgs") or []), key=lambda m: m.id
@@ -3456,39 +3466,105 @@ class UrlDownloader:
             if existing is not None
             else None
         )
+
+        async def run_download(i):
+            if event.is_set():
+                raise _TaskCancelled()
+            m = msgs[i - 1]
+            seq = f"[{i}/{n}] "
+            session["seq"] = seq
+            session["cur_i"] = i
+            session["cur_n"] = n
+            display = self._item_display_name(m)
+            session["cur_display"] = os.path.basename(display)
+            session["title"] = display
+            session["tg_msg"] = m
+            if base:
+                # 用户给了一个基名 -> 旅行_1 / 旅行_2 ...
+                session["final_name"] = sanitize_filename(f"{base}_{i}")
+            else:
+                # 按原名保存
+                session.pop("final_name", None)
+            await self._stage(
+                token,
+                f"{seq}⬇️ 下载中 第 {i}/{n} 个："
+                f"`{os.path.basename(display)[:70]}`\n"
+                f"📁 保存到：`{self._nas_display(rel)}`",
+            )
+            try:
+                local_path, fname, size = await self._download_tg(
+                    token, session, event, None, sub_dir=f"item_{i}"
+                )
+            except _TaskCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"第 {i}/{n} 个下载失败：{type(exc).__name__}: {exc}"
+                ) from exc
+            return local_path, fname, size
+
+        async def run_upload(i, local_path, fname, size):
+            seq = f"[{i}/{n}] "
+            session["cur_i"] = i
+            session["cur_n"] = n
+            session["cur_display"] = os.path.basename(fname)
+            session["uploading"] = True
+            try:
+                await self._move_to_nas(
+                    local_path, rel, token=token, seq=seq
+                )
+            except _TaskCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"第 {i}/{n} 个上传失败：{type(exc).__name__}: {exc}"
+                ) from exc
+            finally:
+                session["uploading"] = False
+            return fname, size
+
+        download_task = None
+        upload_task = None
+        pending_upload = None
+
+        async def settle_upload():
+            """Await the in-flight upload and record it (idempotent)."""
+            nonlocal upload_task, pending_upload
+            if upload_task is None:
+                return
+            try:
+                await upload_task
+            finally:
+                upload_task = None
+                pu = pending_upload
+                pending_upload = None
+            if pu is not None:
+                if existing is not None:
+                    existing.add(pu[0].casefold())
+                results.append(pu)
+                session["multi_done"] = len(results)
+
         try:
-            for i, m in enumerate(msgs, 1):
+            for i in range(1, n + 1):
                 if event.is_set():
                     raise _TaskCancelled()
-                seq = f"[{i}/{n}] "
-                session["seq"] = seq
-                session["cur_i"] = i
-                session["cur_n"] = n
-                display = self._item_display_name(m)
-                session["cur_display"] = os.path.basename(display)
-                session["title"] = display
-                session["tg_msg"] = m
-                if base:
-                    # 用户给了一个基名 -> 旅行_1 / 旅行_2 ...
-                    session["final_name"] = sanitize_filename(f"{base}_{i}")
-                else:
-                    # 按原名保存
-                    session.pop("final_name", None)
-                await self._stage(
-                    token,
-                    f"{seq}⬇️ 下载中 第 {i}/{n} 个：`{os.path.basename(display)[:70]}`\n"
-                    f"📁 保存到：`{self._nas_display(rel)}`",
-                )
+                if download_task is None:
+                    download_task = asyncio.create_task(run_download(i))
                 try:
-                    local_path, fname, size = await self._download_tg(
-                        token, session, event, None
-                    )
-                except _TaskCancelled:
+                    local_path, fname, size = await download_task
+                except BaseException:
+                    # 下载失败/取消时让正在进行的上一件上传自然完成，
+                    # 避免中断 rclone 在 NAS 留下半截文件
+                    try:
+                        await settle_upload()
+                    except BaseException:  # noqa: BLE001
+                        pass
                     raise
-                except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"第 {i}/{n} 个下载失败：{type(exc).__name__}: {exc}"
-                    ) from exc
+                download_task = None
+                if i < n:
+                    # 提前开始下一件的下载，与上一件的上传并行
+                    download_task = asyncio.create_task(run_download(i + 1))
+                await settle_upload()
                 if event.is_set():
                     raise _TaskCancelled()
                 # 批量不逐个弹窗：NAS 同名时自动加 _1 保留两份
@@ -3509,24 +3585,31 @@ class UrlDownloader:
                     os.replace(local_path, new_local)
                     local_path = new_local
                     fname = new_name
-                session["final_name"] = os.path.splitext(fname)[0]
-                session["uploading"] = True
-                try:
-                    await self._move_to_nas(
-                        local_path, rel, token=token, seq=seq
-                    )
-                finally:
-                    session["uploading"] = False
-                if existing is not None:
-                    existing.add(fname.casefold())
-                results.append((fname, size))
-                session["multi_done"] = len(results)
+                upload_task = asyncio.create_task(
+                    run_upload(i, local_path, fname, size)
+                )
+                pending_upload = (fname, size)
+            await settle_upload()
         finally:
+            # 只会取消仍在进行的下载；上传任务从不中途打断
+            if download_task is not None:
+                download_task.cancel()
+                try:
+                    await download_task
+                except BaseException:  # noqa: BLE001
+                    pass
+            if upload_task is not None:
+                # 理论上走到这里时不应有未结束的上传，防御性等它收尾
+                try:
+                    await settle_upload()
+                except BaseException:  # noqa: BLE001
+                    pass
             session.pop("seq", None)
             session.pop("cur_i", None)
             session.pop("cur_n", None)
             session.pop("cur_display", None)
             session.pop("final_name", None)
+            session["uploading"] = False
         total = sum(s for _, s in results)
         total_orig = session.get("batch_total") or n
         shown = "\n".join(
