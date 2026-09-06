@@ -545,6 +545,65 @@ class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(client.sent))
         self.assertIn("自动记录", client.sent[0])
 
+    def _select_session(self, n):
+        msgs = []
+        for mid in range(1, n + 1):
+            media = SimpleNamespace(
+                value="photo", file_name=None, file_size=2048
+            )
+            m = SimpleNamespace(
+                id=mid,
+                from_user=SimpleNamespace(id=self.USER),
+                chat=SimpleNamespace(id=self.CHAT),
+                media=media,
+            )
+            m.photo = media
+            msgs.append(m)
+        return {
+            "token": "select-token",
+            "user_id": self.USER,
+            "chat_id": self.CHAT,
+            "kind": "tg",
+            "multi": True,
+            "media_msgs": msgs,
+            "selected": [True] * n,
+            "size": 2048 * n,
+            "folder": "旅行",
+            "final_name": None,
+        }
+
+    async def test_select_card_text_stays_under_limit_for_large_batches(self):
+        downloader = UrlDownloader()
+        session = self._select_session(80)
+
+        text, k = downloader._select_text(session)
+
+        self.assertEqual(80, k)
+        self.assertLess(len(text), 4096)
+        self.assertIn("共 80 个文件", text)
+        self.assertIn("还有 55 个未列出", text)
+
+    async def test_select_markup_respects_telegram_button_limit(self):
+        downloader = UrlDownloader()
+        session = self._select_session(120)
+
+        markup = downloader._select_markup(session, 120)
+        rows = markup.inline_keyboard
+        buttons = sum(len(row) for row in rows)
+        self.assertLessEqual(buttons, 100)
+        # 前 90 个单项按钮 + 全选/全不选 + 下载 + 改文件夹/取消
+        self.assertEqual(90 + 5, buttons)
+
+    async def test_unique_local_name_matches_remote_suffix_scheme(self):
+        downloader = UrlDownloader()
+        existing = {"a.jpg", "b.PNG", "a_1.jpg", "a_2.jpg"}
+        folded = {x.casefold() for x in existing}
+
+        self.assertEqual("a_3.jpg", downloader._unique_local_name(folded, "a.jpg"))
+        self.assertEqual("b_1.PNG", downloader._unique_local_name(folded, "b.PNG"))
+        # 无冲突时原样返回
+        self.assertEqual("c.jpg", downloader._unique_local_name(folded, "c.jpg"))
+
     async def test_stray_continue_reuses_folder_and_starts_download(self):
         downloader = UrlDownloader()
         started = []

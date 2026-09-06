@@ -65,6 +65,10 @@ _QUALITY_EXPIRE_SECS = 15 * 60
 _MEDIA_COLLECT_SECS = 2.2
 _FOLDER_NAME_WAIT_SECS = 5 * 60
 _CONFLICT_WAIT_SECS = 60
+# 勾选清单卡片：文本最多列出的条目数 / 单项按钮上限（Telegram 单条
+# 消息最多 100 个按钮，留出 5 个给 全选/全不选/下载/改文件夹/取消）
+_SELECT_TEXT_MAX_ITEMS = 25
+_SELECT_BUTTON_MAX_ITEMS = 90
 # Telegram 对群聊的限流约 20 条消息/分钟（编辑消息同样计入）。
 # 固定 4 秒间隔 ≈ 15 条/分钟，给阶段提示/兜底补发留出余量。
 _REPORT_MIN_INTERVAL = 4.0
@@ -639,6 +643,21 @@ class UrlDownloader:
         candidate = name
         idx = 1
         while candidate.casefold() in existing:
+            candidate = f"{root}_{idx}{ext}"
+            idx += 1
+        return candidate
+
+    @staticmethod
+    def _unique_local_name(existing_folded: set, name: str) -> str:
+        """Free NAS name against an in-memory set of casefolded names.
+
+        Mirrors _unique_nas_name's suffix scheme (name_1.ext, name_2.ext),
+        without an rclone round trip per candidate.
+        """
+        root, ext = os.path.splitext(name)
+        candidate = name
+        idx = 1
+        while candidate.casefold() in existing_folded:
             candidate = f"{root}_{idx}{ext}"
             idx += 1
         return candidate
@@ -1678,7 +1697,7 @@ class UrlDownloader:
         lines = []
         total = session.get("size") or 0
         lines.append(f"📎 共 {len(msgs)} 个文件（合计 {_format_size(total)}）")
-        for i, m in enumerate(msgs, 1):
+        for i, m in enumerate(msgs[:_SELECT_TEXT_MAX_ITEMS], 1):
             md = getattr(m, m.media.value, None) if m.media else None
             mark = "✅" if (selected and i - 1 < len(selected) and selected[i - 1]) else "⬜️"
             size_s = (
@@ -1687,6 +1706,14 @@ class UrlDownloader:
                 else ""
             )
             lines.append(f"{mark} {i}. `{self._item_display_name(m)[:60]}`{size_s}")
+        overflow = len(msgs) - _SELECT_TEXT_MAX_ITEMS
+        if overflow > 0:
+            lines.append(f"…还有 {overflow} 个未列出，点下方对应编号按钮可逐项勾选")
+        if len(msgs) > _SELECT_BUTTON_MAX_ITEMS:
+            lines.append(
+                f"⚠️ 超过 {_SELECT_BUTTON_MAX_ITEMS} 个时只保留前 "
+                f"{_SELECT_BUTTON_MAX_ITEMS} 个按钮，其余默认全部下载"
+            )
         folder = session.get("folder") or ""
         base = session.get("final_name")
         base_note = ""
@@ -1704,7 +1731,7 @@ class UrlDownloader:
         msgs = session.get("media_msgs") or []
         selected = session.get("selected") or []
         rows = []
-        for i in range(len(msgs)):
+        for i in range(min(len(msgs), _SELECT_BUTTON_MAX_ITEMS)):
             on = bool(selected and i < len(selected) and selected[i])
             label = f"{'✅' if on else '⬜️'} {i + 1}. {self._item_display_name(msgs[i])[:36]}"
             rows.append(
@@ -3421,6 +3448,14 @@ class UrlDownloader:
         rel = session.get("folder") or ""
         base = session.get("final_name")
         results = []
+        # 整批只列一次目标目录，避免每个文件都额外起 rclone 进程查重；
+        # 目录列不出来时退回“每文件远程查重”的旧逻辑
+        existing = await self._list_files(rel)
+        existing = (
+            {name.casefold() for name in existing}
+            if existing is not None
+            else None
+        )
         try:
             for i, m in enumerate(msgs, 1):
                 if event.is_set():
@@ -3457,7 +3492,16 @@ class UrlDownloader:
                 if event.is_set():
                     raise _TaskCancelled()
                 # 批量不逐个弹窗：NAS 同名时自动加 _1 保留两份
-                if await self._nas_file_exists(rel, fname):
+                if existing is not None:
+                    new_name = self._unique_local_name(existing, fname)
+                    if new_name != fname:
+                        new_local = os.path.join(
+                            os.path.dirname(local_path), new_name
+                        )
+                        os.replace(local_path, new_local)
+                        local_path = new_local
+                        fname = new_name
+                elif await self._nas_file_exists(rel, fname):
                     new_name = await self._unique_nas_name(rel, fname)
                     new_local = os.path.join(
                         os.path.dirname(local_path), new_name
@@ -3473,6 +3517,8 @@ class UrlDownloader:
                     )
                 finally:
                     session["uploading"] = False
+                if existing is not None:
+                    existing.add(fname.casefold())
                 results.append((fname, size))
                 session["multi_done"] = len(results)
         finally:
