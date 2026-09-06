@@ -892,7 +892,8 @@ class UrlDownloaderScratchCleanupTest(unittest.IsolatedAsyncioTestCase):
         downloader.sessions["t2"] = session
         downloader.pending_folder[self.USER] = "t2"
 
-        # 文件夹卡已弹出时又并入一个文件 -> 每条提示都会被记录
+        # 文件夹卡已弹出时又并入一个文件 -> 连续提示只留最新一条：
+        # 第二条发出前会自动删掉第一条
         session["media_msgs"] = [m1, m2, self._photo(3)]
         await downloader._refresh_question_card(client, session)
         session["media_msgs"] = [m1, m2, self._photo(3), self._photo(4)]
@@ -902,13 +903,49 @@ class UrlDownloaderScratchCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             client.sent[0][1].startswith("➕ 已自动并入新到的文件")
         )
-        self.assertEqual(2, len(session["scratch_msgs"]))
+        # 第一条(501)已被第二条发出前的清理删除，记录里只剩最新(502)
+        self.assertEqual([(self.CHAT, [501])], bot.deleted)
+        self.assertEqual([502], session["scratch_msgs"])
 
         # 任务结束（无论成功/取消）都会走到统一清理
-        ids = list(session["scratch_msgs"])
         await downloader._scratch_clear(session)
 
-        self.assertEqual([(self.CHAT, ids)], bot.deleted)
+        self.assertEqual(
+            [(self.CHAT, [501]), (self.CHAT, [502])], bot.deleted
+        )
+        self.assertEqual([], session["scratch_msgs"])
+
+    async def test_failed_delete_is_retried_by_next_cleanup(self):
+        downloader = UrlDownloader()
+
+        class _FlakyBot(_ScratchDeleteBot):
+            def __init__(self):
+                super().__init__()
+                self.fail_once = True
+
+            async def delete_messages(self, chat_id, message_ids):
+                if self.fail_once:
+                    self.fail_once = False
+                    raise RuntimeError("network down")
+                await super().delete_messages(chat_id, message_ids)
+
+        bot = _FlakyBot()
+        downloader.bot = bot
+        client = _ScratchClient()
+        session = {"token": "t4", "chat_id": self.CHAT}
+
+        await downloader._scratch_send(client, session, "➕ 提示")
+        self.assertEqual([501], session["scratch_msgs"])
+
+        # 第一次删除失败：消息放回记录，等待下次清理重试
+        await downloader._scratch_clear(session)
+        self.assertEqual([], bot.deleted)
+        self.assertEqual([501], session["scratch_msgs"])
+
+        # 任务收尾再次清理：这次成功
+        await downloader._scratch_clear(session)
+        self.assertEqual([(self.CHAT, [501])], bot.deleted)
+        self.assertEqual([], session["scratch_msgs"])
 
     async def test_stray_received_while_running_is_recorded(self):
         downloader = UrlDownloader()

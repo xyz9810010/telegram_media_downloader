@@ -2431,16 +2431,18 @@ class UrlDownloader:
     # ----------------------------------------------------------- state helpers
 
     async def _scratch_send(self, client, session, text, chat_id=None):
-        """Send a one-off task hint that is deleted when the task ends.
+        """Send a one-off task hint; only the newest one stays on screen.
 
         These are the throw-away notices ("➕ 已自动并入新到的文件…",
         "📌 收到新文件…", busy hints...) that only make sense while the task
-        is on screen. Their message ids are recorded on the session so the
-        task teardown can delete them, leaving only the final result card.
+        is on screen. A new hint deletes the previous one first, so the chat
+        never stacks a column of them; ids are recorded on the session and
+        the task teardown clears whatever is still left.
         """
         chat_id = chat_id or session.get("chat_id")
         if not chat_id:
             return None
+        await self._scratch_clear(session)
         try:
             msg = await client.send_message(chat_id, text)
         except Exception as exc:  # noqa: BLE001
@@ -2456,14 +2458,19 @@ class UrlDownloader:
         return msg
 
     async def _scratch_clear(self, session):
-        """Delete the recorded one-off hints (safe to call twice)."""
+        """Delete the recorded one-off hints (safe to call twice).
+
+        Messages that fail to delete are put back on the record so a later
+        cleanup (next hint, or the task teardown) retries them.
+        """
         ids = session.get("scratch_msgs") or []
         if not ids:
             return
-        session["scratch_msgs"] = []
         chat_id = session.get("chat_id")
         if not chat_id:
             return
+        session["scratch_msgs"] = []
+        failed = []
         for i in range(0, len(ids), 100):
             try:
                 await self.bot.delete_messages(chat_id, ids[i : i + 100])
@@ -2473,6 +2480,10 @@ class UrlDownloader:
                     type(exc).__name__,
                     exc,
                 )
+                failed.extend(ids[i : i + 100])
+        if failed:
+            leftover = session.setdefault("scratch_msgs", [])
+            session["scratch_msgs"] = list(dict.fromkeys(failed + leftover))
 
     async def _begin(self, token):
         """Start the download task for a session (idempotent)."""
@@ -2901,6 +2912,9 @@ class UrlDownloader:
                 self.progress_cache[token] = (
                     chat_id, status.id, 0.0, 0.0
                 )
+            # 真正开始下载前，清掉卡片阶段残留的一次性提示
+            # （如“➕ 已自动并入新到的文件…”），聊天只留进度/结果卡
+            await self._scratch_clear(session)
             try:
                 if session.get("multi"):
                     await self._download_multi(token, session, event)
