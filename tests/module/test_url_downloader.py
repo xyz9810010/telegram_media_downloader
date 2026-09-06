@@ -623,25 +623,39 @@ class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
 
 
 class UrlDownloaderPipelineTest(unittest.IsolatedAsyncioTestCase):
-    """The batch download/upload legs must overlap without losing files."""
+    """批量下载：同时最多 2 个下载，上传严格串行、按消息顺序落盘。
+
+    fake 只替换实例方法，统计下载/上传在同一时刻的真实在途数
+    （在 await 睡眠期间计数），用于断言并发度与顺序。
+    """
 
     async def _downloader_with_fakes(self, n_items, dl_secs, up_secs):
         downloader = UrlDownloader()
         downloader.tmp_root = tempfile.mkdtemp(prefix="urldl-pipe-")
         self.addCleanup(shutil.rmtree, downloader.tmp_root, True)
-        state = {"dl": 0, "up": 0, "max": 0}
+        state = {
+            "dl": 0,        # 正在下载中的文件数
+            "dl_max": 0,    # 下载并发峰值
+            "up": 0,        # 正在上传中的文件数
+            "up_max": 0,    # 上传并发峰值（必须恒为 1）
+            "busy_max": 0,  # 下载+上传同时在途峰值
+            "up_order": [],  # 上传文件名（即 NAS 落盘顺序）
+            "fail_at": None,      # 指定序号的下载抛错
+            "set_cancel_at": None,  # 指定序号的下载一开始就置取消
+        }
 
         async def fake_list_files(rel=""):
             del rel
             return {"a.jpg"}
 
-        async def fake_download_tg(
-            token, session, event, status, sub_dir=""
-        ):
-            del token, event, status
+        async def fake_download_tg(token, session, event, status, sub_dir=""):
+            del token, status
             i = session.get("cur_i") or 1
             state["dl"] += 1
-            state["max"] = max(state["max"], state["dl"] + state["up"])
+            state["dl_max"] = max(state["dl_max"], state["dl"])
+            state["busy_max"] = max(
+                state["busy_max"], state["dl"] + state["up"]
+            )
             item_dir = os.path.join(
                 downloader.tmp_root, "pipe", sub_dir or ""
             )
@@ -650,7 +664,11 @@ class UrlDownloaderPipelineTest(unittest.IsolatedAsyncioTestCase):
             with open(path, "wb") as fh:
                 fh.write(b"x" * 8)
             try:
+                if state["set_cancel_at"] == i:
+                    event.set()
                 await asyncio.sleep(dl_secs)
+                if state["fail_at"] == i:
+                    raise RuntimeError("boom")
             finally:
                 state["dl"] -= 1
             return path, "a.jpg", 8
@@ -658,7 +676,11 @@ class UrlDownloaderPipelineTest(unittest.IsolatedAsyncioTestCase):
         async def fake_move_to_nas(local_path, rel="", token=None, seq=""):
             del rel, token, seq
             state["up"] += 1
-            state["max"] = max(state["max"], state["dl"] + state["up"])
+            state["up_max"] = max(state["up_max"], state["up"])
+            state["busy_max"] = max(
+                state["busy_max"], state["dl"] + state["up"]
+            )
+            state["up_order"].append(os.path.basename(local_path))
             try:
                 await asyncio.sleep(up_secs)
             finally:
@@ -698,21 +720,37 @@ class UrlDownloaderPipelineTest(unittest.IsolatedAsyncioTestCase):
         }
         return downloader, session, state
 
-    async def test_upload_overlaps_next_download_and_renames_in_order(self):
+    async def test_two_downloads_at_once_uploads_serial_in_order(self):
         downloader, session, state = await self._downloader_with_fakes(
-            4, dl_secs=0.05, up_secs=0.25
+            6, dl_secs=0.05, up_secs=0.08
         )
 
         await downloader._download_multi("pipe", session, asyncio.Event())
 
-        # 目标目录原本有 a.jpg，四个同名文件应依次自动改成 _1.._4
-        self.assertEqual(4, session["multi_done"])
-        # 上传(i) 与 下载(i+1) 曾经同时进行
-        self.assertGreaterEqual(state["max"], 2)
+        # 下载并发达到 2 路；上传从未并发（恒为 1 路）
+        self.assertEqual(2, state["dl_max"])
+        self.assertEqual(1, state["up_max"])
+        # 上传与后续下载确有重叠（下载2 + 上传1 同窗口）
+        self.assertGreaterEqual(state["busy_max"], 3)
+        # 全部 6 个文件都上传成功
+        self.assertEqual(6, session["multi_done"])
+        # 目标目录原本有 a.jpg：按消息顺序落盘为 a_1.jpg..a_6.jpg
+        self.assertEqual(
+            [f"a_{i}.jpg" for i in range(1, 7)], state["up_order"]
+        )
+        # 本地临时目录不应残留任何已上传文件
+        leftovers = []
+        for root, _dirs, files in os.walk(
+            os.path.join(downloader.tmp_root, "pipe")
+        ):
+            leftovers.extend(
+                os.path.join(root, f) for f in files if f.endswith(".jpg")
+            )
+        self.assertEqual([], leftovers)
 
-    async def test_pipeline_saves_every_file_with_unique_names(self):
-        downloader, session, _ = await self._downloader_with_fakes(
-            4, dl_secs=0.02, up_secs=0.1
+    async def test_summary_shows_all_saved_files_in_order(self):
+        downloader, session, state = await self._downloader_with_fakes(
+            4, dl_secs=0.02, up_secs=0.02
         )
         results_holder = {}
 
@@ -726,9 +764,46 @@ class UrlDownloaderPipelineTest(unittest.IsolatedAsyncioTestCase):
 
         text = results_holder["text"]
         self.assertIn("已保存 4/4 个文件", text)
+        self.assertIn("合计大小：", text)
+        self.assertEqual(4, len(state["up_order"]))
         pos = [text.index(suffix) for suffix in
                ("a_1.jpg", "a_2.jpg", "a_3.jpg", "a_4.jpg")]
         self.assertEqual(pos, sorted(pos))
+
+    async def test_cancel_stops_rest_but_finishes_inflight_upload(self):
+        downloader, session, state = await self._downloader_with_fakes(
+            4, dl_secs=0.05, up_secs=0.12
+        )
+        state["set_cancel_at"] = 3
+
+        with self.assertRaises(url_mod._TaskCancelled):
+            await downloader._download_multi("pipe", session, asyncio.Event())
+
+        # 取消前只落盘了第 1 个（当时在途），第 2 个已下载但未开始上传，
+        # 之后的不再启动新的上传
+        self.assertEqual(1, session["multi_done"])
+        self.assertEqual(["a_1.jpg"], state["up_order"])
+        self.assertEqual(1, state["up_max"])
+        self.assertEqual(2, state["dl_max"])
+        # 所有下载协程都已收尾（在途的被取消并在 finally 中减计数）
+        self.assertEqual(0, state["dl"])
+        self.assertEqual(0, state["up"])
+
+    async def test_failure_uploads_preceding_files_in_order_then_raises(self):
+        downloader, session, state = await self._downloader_with_fakes(
+            4, dl_secs=0.03, up_secs=0.08
+        )
+        state["fail_at"] = 3
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await downloader._download_multi("pipe", session, asyncio.Event())
+
+        self.assertIn("第 3/4 个下载失败", str(ctx.exception))
+        # 失败序号之前的文件按顺序落盘；之后的（第 4 个）不传
+        self.assertEqual(2, session["multi_done"])
+        self.assertEqual(["a_1.jpg", "a_2.jpg"], state["up_order"])
+        self.assertEqual(0, state["dl"])
+        self.assertEqual(0, state["up"])
 
 
 if __name__ == "__main__":

@@ -69,6 +69,8 @@ _CONFLICT_WAIT_SECS = 60
 # 消息最多 100 个按钮，留出 5 个给 全选/全不选/下载/改文件夹/取消）
 _SELECT_TEXT_MAX_ITEMS = 25
 _SELECT_BUTTON_MAX_ITEMS = 90
+# 批量下载并发度：同时下载的文件数（上传仍保持单路串行、按顺序落盘）
+_MULTI_DL_CONCURRENCY = 2
 # Telegram 对群聊的限流约 20 条消息/分钟（编辑消息同样计入）。
 # 固定 4 秒间隔 ≈ 15 条/分钟，给阶段提示/兜底补发留出余量。
 _REPORT_MIN_INTERVAL = 4.0
@@ -3444,12 +3446,13 @@ class UrlDownloader:
                     )
 
     async def _download_multi(self, token, session, event):
-        """Download a batch to the chosen folder with a download/upload pipeline.
+        """Download a batch with 2-way download + serialized NAS upload.
 
-        The NAS upload of item i runs while item i+1 is downloading, so the
-        two slow legs overlap instead of idling each other. Uploads stay
-        serialized and in order; every file is auto-renamed (_1/_2) on NAS
-        name collision, and the temp dir never holds more than ~2 files.
+        Up to _MULTI_DL_CONCURRENCY items download at the same time while the
+        finished files upload to the NAS one by one, strictly in message
+        order, so the _1/_2 auto-rename stays deterministic. Every download
+        runs on its own temp sub-directory and its own session copy so two
+        in-flight downloads can never overwrite each other's naming/status.
         """
         msgs = sorted(
             (session.get("media_msgs") or []), key=lambda m: m.id
@@ -3472,28 +3475,34 @@ class UrlDownloader:
                 raise _TaskCancelled()
             m = msgs[i - 1]
             seq = f"[{i}/{n}] "
+            display = self._item_display_name(m)
             session["seq"] = seq
             session["cur_i"] = i
             session["cur_n"] = n
-            display = self._item_display_name(m)
             session["cur_display"] = os.path.basename(display)
-            session["title"] = display
-            session["tg_msg"] = m
-            if base:
-                # 用户给了一个基名 -> 旅行_1 / 旅行_2 ...
-                session["final_name"] = sanitize_filename(f"{base}_{i}")
-            else:
-                # 按原名保存
-                session.pop("final_name", None)
             await self._stage(
                 token,
                 f"{seq}⬇️ 下载中 第 {i}/{n} 个："
                 f"`{os.path.basename(display)[:70]}`\n"
                 f"📁 保存到：`{self._nas_display(rel)}`",
             )
+            # 每个下载用独立的会话副本，两个并发下载互不串用
+            # 文件名/标题/seq 等字段
+            worker = dict(session)
+            worker["seq"] = seq
+            worker["cur_i"] = i
+            worker["cur_n"] = n
+            worker["cur_display"] = os.path.basename(display)
+            worker["title"] = display
+            worker["tg_msg"] = m
+            if base:
+                # 用户给了一个基名 -> 旅行_1 / 旅行_2 ...
+                worker["final_name"] = sanitize_filename(f"{base}_{i}")
+            else:
+                worker.pop("final_name", None)
             try:
                 local_path, fname, size = await self._download_tg(
-                    token, session, event, None, sub_dir=f"item_{i}"
+                    token, worker, event, None, sub_dir=f"item_{i}"
                 )
             except _TaskCancelled:
                 raise
@@ -3501,6 +3510,7 @@ class UrlDownloader:
                 raise RuntimeError(
                     f"第 {i}/{n} 个下载失败：{type(exc).__name__}: {exc}"
                 ) from exc
+            # ready 统一存 (local_path, fname, size)，序号由字典键承担
             return local_path, fname, size
 
         async def run_upload(i, local_path, fname, size):
@@ -3523,9 +3533,47 @@ class UrlDownloader:
                 session["uploading"] = False
             return fname, size
 
-        download_task = None
+        active = {}   # 下载中的条目：index -> task
+        ready = {}    # 已下载待上传：index -> (local_path, fname, size)
+        next_start = 1
+        upload_next = 1
         upload_task = None
         pending_upload = None
+
+        async def start_next_upload():
+            """Pop the next in-order finished file and start its upload."""
+            nonlocal upload_task, pending_upload, upload_next
+            if upload_task is not None or upload_next not in ready:
+                return False
+            local_path, fname, size = ready.pop(upload_next)
+            i = upload_next
+            if event.is_set():
+                raise _TaskCancelled()
+            # 批量不逐个弹窗：NAS 同名时自动加 _1 保留两份。此时上一件
+            # 上传已落定，内存名单里包含它，不会撞名
+            if existing is not None:
+                new_name = self._unique_local_name(existing, fname)
+                if new_name != fname:
+                    new_local = os.path.join(
+                        os.path.dirname(local_path), new_name
+                    )
+                    os.replace(local_path, new_local)
+                    local_path = new_local
+                    fname = new_name
+            elif await self._nas_file_exists(rel, fname):
+                new_name = await self._unique_nas_name(rel, fname)
+                new_local = os.path.join(
+                    os.path.dirname(local_path), new_name
+                )
+                os.replace(local_path, new_local)
+                local_path = new_local
+                fname = new_name
+            upload_task = asyncio.create_task(
+                run_upload(i, local_path, fname, size)
+            )
+            pending_upload = (fname, size)
+            upload_next += 1
+            return True
 
         async def settle_upload():
             """Await the in-flight upload and record it (idempotent)."""
@@ -3544,66 +3592,90 @@ class UrlDownloader:
                 results.append(pu)
                 session["multi_done"] = len(results)
 
-        try:
-            for i in range(1, n + 1):
-                if event.is_set():
-                    raise _TaskCancelled()
-                if download_task is None:
-                    download_task = asyncio.create_task(run_download(i))
-                try:
-                    local_path, fname, size = await download_task
-                except BaseException:
-                    # 下载失败/取消时让正在进行的上一件上传自然完成，
-                    # 避免中断 rclone 在 NAS 留下半截文件
-                    try:
+        async def stop_active_downloads():
+            """Cancel in-flight downloads and wait for their cleanup."""
+            tasks = list(active.values())
+            active.clear()
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        async def flush_before_failure(failed_idx):
+            """Let uploads of files downloaded before the failed one finish."""
+            try:
+                while upload_next < failed_idx:
+                    if upload_task is not None:
                         await settle_upload()
-                    except BaseException:  # noqa: BLE001
-                        pass
-                    raise
-                download_task = None
-                if i < n:
-                    # 提前开始下一件的下载，与上一件的上传并行
-                    download_task = asyncio.create_task(run_download(i + 1))
+                    elif not await start_next_upload():
+                        break
                 await settle_upload()
+            except BaseException:  # noqa: BLE001
+                # 保留原始下载错误作为主错误
+                pass
+
+        try:
+            while upload_next <= n or active or upload_task is not None:
                 if event.is_set():
                     raise _TaskCancelled()
-                # 批量不逐个弹窗：NAS 同名时自动加 _1 保留两份
-                if existing is not None:
-                    new_name = self._unique_local_name(existing, fname)
-                    if new_name != fname:
-                        new_local = os.path.join(
-                            os.path.dirname(local_path), new_name
-                        )
-                        os.replace(local_path, new_local)
-                        local_path = new_local
-                        fname = new_name
-                elif await self._nas_file_exists(rel, fname):
-                    new_name = await self._unique_nas_name(rel, fname)
-                    new_local = os.path.join(
-                        os.path.dirname(local_path), new_name
+                # 始终保持最多 _MULTI_DL_CONCURRENCY 个下载在途
+                while (
+                    next_start <= n
+                    and len(active) < _MULTI_DL_CONCURRENCY
+                ):
+                    active[next_start] = asyncio.create_task(
+                        run_download(next_start)
                     )
-                    os.replace(local_path, new_local)
-                    local_path = new_local
-                    fname = new_name
-                upload_task = asyncio.create_task(
-                    run_upload(i, local_path, fname, size)
+                    next_start += 1
+                if upload_next in ready and upload_task is None:
+                    await start_next_upload()
+                wait_tasks = list(active.values())
+                if upload_task is not None and not upload_task.done():
+                    wait_tasks.append(upload_task)
+                if not wait_tasks:
+                    if upload_next <= n:
+                        raise RuntimeError("批量下载内部状态异常：任务列表为空")
+                    break
+                # 1 秒轮询一次，排队/下载中也能在 ~1s 内响应“取消”
+                done, _ = await asyncio.wait(
+                    wait_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=1.0,
                 )
-                pending_upload = (fname, size)
+                for task in done:
+                    if upload_task is not None and task is upload_task:
+                        try:
+                            await settle_upload()
+                        except BaseException:
+                            await stop_active_downloads()
+                            raise
+                        continue
+                    idx = next(
+                        (k for k, t in active.items() if t is task), None
+                    )
+                    if idx is None:
+                        continue
+                    del active[idx]
+                    try:
+                        ready[idx] = task.result()
+                    except _TaskCancelled:
+                        # 用户取消：停掉其余下载，但不再启动新的上传
+                        # （已在途的上传会自然收尾并计入已保存）
+                        await stop_active_downloads()
+                        raise
+                    except BaseException:
+                        # 下载失败：取消其余下载；失败序号之前的已下载文件
+                        # 照常上传完（不浪费），之后的丢弃（与串行一致）
+                        await stop_active_downloads()
+                        await flush_before_failure(idx)
+                        raise
             await settle_upload()
         finally:
-            # 只会取消仍在进行的下载；上传任务从不中途打断
-            if download_task is not None:
-                download_task.cancel()
-                try:
-                    await download_task
-                except BaseException:  # noqa: BLE001
-                    pass
-            if upload_task is not None:
-                # 理论上走到这里时不应有未结束的上传，防御性等它收尾
-                try:
-                    await settle_upload()
-                except BaseException:  # noqa: BLE001
-                    pass
+            await stop_active_downloads()
+            try:
+                await settle_upload()
+            except BaseException:  # noqa: BLE001
+                pass
             session.pop("seq", None)
             session.pop("cur_i", None)
             session.pop("cur_n", None)
