@@ -806,5 +806,143 @@ class UrlDownloaderPipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, state["up"])
 
 
+class _ScratchDeleteBot:
+    """Records delete_messages calls (the real bot deletes for real)."""
+
+    def __init__(self):
+        self.deleted = []
+
+    async def delete_messages(self, chat_id, message_ids):
+        self.deleted.append((chat_id, list(message_ids)))
+
+
+class _ScratchClient:
+    """Minimal fake bot client that hands out message ids."""
+
+    def __init__(self):
+        self.sent = []
+        self._next_id = 500
+
+    async def send_message(self, chat_id, text, **kwargs):
+        del kwargs
+        self._next_id += 1
+        self.sent.append((chat_id, text))
+        return SimpleNamespace(
+            id=self._next_id, chat=SimpleNamespace(id=chat_id)
+        )
+
+
+class UrlDownloaderScratchCleanupTest(unittest.IsolatedAsyncioTestCase):
+    """任务期的一次性提示要记录并在收尾时删除，聊天不留垃圾消息。"""
+
+    USER = 777
+    CHAT = -100
+
+    def _photo(self, mid):
+        media = SimpleNamespace(
+            value="photo", file_name=None, file_size=8
+        )
+        m = SimpleNamespace(
+            id=mid,
+            from_user=SimpleNamespace(id=self.USER),
+            chat=SimpleNamespace(id=self.CHAT),
+            media=media,
+        )
+        m.photo = media
+        return m
+
+    async def test_scratch_hint_is_recorded_and_deleted_once(self):
+        downloader = UrlDownloader()
+        bot = _ScratchDeleteBot()
+        downloader.bot = bot
+        client = _ScratchClient()
+        session = {"token": "t1", "chat_id": self.CHAT}
+
+        await downloader._scratch_send(client, session, "➕ 一次性提示")
+
+        self.assertEqual([501], session["scratch_msgs"])
+        self.assertEqual(1, len(client.sent))
+
+        await downloader._scratch_clear(session)
+
+        self.assertEqual([(self.CHAT, [501])], bot.deleted)
+        self.assertEqual([], session["scratch_msgs"])
+        # 已清空后再清不会重复删除
+        await downloader._scratch_clear(session)
+        self.assertEqual([(self.CHAT, [501])], bot.deleted)
+
+    async def test_auto_merge_notices_are_deleted_when_task_ends(self):
+        downloader = UrlDownloader()
+        bot = _ScratchDeleteBot()
+        downloader.bot = bot
+        client = _ScratchClient()
+        m1, m2 = self._photo(1), self._photo(2)
+        session = {
+            "token": "t2",
+            "user_id": self.USER,
+            "chat_id": self.CHAT,
+            "kind": "tg",
+            "multi": True,
+            "media_msgs": [m1, m2],
+            "size": 16,
+            "at_picker": True,
+            "folder": "旅行",
+            "started": False,
+        }
+        downloader.sessions["t2"] = session
+        downloader.pending_folder[self.USER] = "t2"
+
+        # 文件夹卡已弹出时又并入一个文件 -> 每条提示都会被记录
+        session["media_msgs"] = [m1, m2, self._photo(3)]
+        await downloader._refresh_question_card(client, session)
+        session["media_msgs"] = [m1, m2, self._photo(3), self._photo(4)]
+        await downloader._refresh_question_card(client, session)
+
+        self.assertEqual(2, len(client.sent))
+        self.assertTrue(
+            client.sent[0][1].startswith("➕ 已自动并入新到的文件")
+        )
+        self.assertEqual(2, len(session["scratch_msgs"]))
+
+        # 任务结束（无论成功/取消）都会走到统一清理
+        ids = list(session["scratch_msgs"])
+        await downloader._scratch_clear(session)
+
+        self.assertEqual([(self.CHAT, ids)], bot.deleted)
+
+    async def test_stray_received_while_running_is_recorded(self):
+        downloader = UrlDownloader()
+        bot = _ScratchDeleteBot()
+        downloader.bot = bot
+        client = _ScratchClient()
+        m1 = self._photo(1)
+        session = {
+            "token": "t3",
+            "user_id": self.USER,
+            "chat_id": self.CHAT,
+            "kind": "tg",
+            "tg_msg": m1,
+            "title": "批量媒体",
+            "multi": True,
+            "media_msgs": [m1],
+            "started": True,
+        }
+        downloader.sessions["t3"] = session
+
+        # 下载中又转发来两个文件：第一条会提示并记录，第二条被
+        # busy 节流挡住不重复发
+        await downloader._media_message_locked(client, self._photo(2))
+        await downloader._media_message_locked(client, self._photo(3))
+
+        self.assertEqual(1, len(client.sent))
+        self.assertTrue(client.sent[0][1].startswith("📌 收到新文件"))
+        self.assertEqual([501], session["scratch_msgs"])
+        self.assertEqual(2, len(session["strays"]))
+
+        await downloader._scratch_clear(session)
+
+        self.assertEqual([(self.CHAT, [501])], bot.deleted)
+
+
 if __name__ == "__main__":
     unittest.main()

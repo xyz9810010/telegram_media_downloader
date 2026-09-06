@@ -1355,10 +1355,13 @@ class UrlDownloader:
                         n = len(session.get("media_msgs") or []) + len(
                             session.get("strays") or []
                         )
-                        await client.send_message(
-                            message.chat.id,
+                        # 一次性提示：任务收尾时自动删除，不留垃圾消息
+                        await self._scratch_send(
+                            client,
+                            session,
                             f"📌 收到新文件（本批共 {n} 张）：已自动记录，"
                             "本批结束后会自动接着下载到同一文件夹，不用再转发。",
+                            chat_id=message.chat.id,
                         )
                 return
             logger.warning(
@@ -1372,24 +1375,30 @@ class UrlDownloader:
                         cn = session.get("cur_n") or "?"
                         cur = session.get("cur_display")
                         cur_s = f"（`{cur}`）" if cur else ""
-                        await client.send_message(
-                            message.chat.id,
+                        await self._scratch_send(
+                            client,
+                            session,
                             f"⏳ 正在下载上一批：第 {ci}/{cn} 个{cur_s}\n"
                             "新转发的文件这次不会自动加入。\n"
                             "可以等这一批结束再转发；也可以回复「取消」"
                             "停止当前任务后再发。",
+                            chat_id=message.chat.id,
                         )
                     else:
-                        await client.send_message(
-                            message.chat.id,
+                        await self._scratch_send(
+                            client,
+                            session,
                             "⏳ 正在下载其他文件（看上方的进度消息），"
                             "请等它结束再转发；或回复「取消」停止当前任务。",
+                            chat_id=message.chat.id,
                         )
                 else:
-                    await client.send_message(
-                        message.chat.id,
+                    await self._scratch_send(
+                        client,
+                        session,
                         "⏳ 你还有一个任务在等你处理（看上面的卡片），"
                         "先处理完它或回复「取消」，再发送新的媒体",
+                        chat_id=message.chat.id,
                     )
             return
 
@@ -1465,14 +1474,13 @@ class UrlDownloader:
             return
         if self.pending_folder.get(user_id) == token and session.get("at_picker"):
             # 文件夹卡：不重列 NAS（避免打断导航），补一条提示即可
-            try:
-                await client.send_message(
-                    session.get("chat_id"),
-                    f"➕ 已自动并入新到的文件：这批现在共 {n} 个，"
-                    "继续在下方卡片选文件夹后即可一起下载。",
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"urldl batch-update note failed: {exc}")
+            # 一次性提示：任务收尾时自动删除
+            await self._scratch_send(
+                client,
+                session,
+                f"➕ 已自动并入新到的文件：这批现在共 {n} 个，"
+                "继续在下方卡片选文件夹后即可一起下载。",
+            )
             return
         logger.info(f"urldl late media merged during quiet stage of {token}")
 
@@ -2422,6 +2430,50 @@ class UrlDownloader:
 
     # ----------------------------------------------------------- state helpers
 
+    async def _scratch_send(self, client, session, text, chat_id=None):
+        """Send a one-off task hint that is deleted when the task ends.
+
+        These are the throw-away notices ("➕ 已自动并入新到的文件…",
+        "📌 收到新文件…", busy hints...) that only make sense while the task
+        is on screen. Their message ids are recorded on the session so the
+        task teardown can delete them, leaving only the final result card.
+        """
+        chat_id = chat_id or session.get("chat_id")
+        if not chat_id:
+            return None
+        try:
+            msg = await client.send_message(chat_id, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "urldl hint send failed: {}: {}",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        msgs = session.setdefault("scratch_msgs", [])
+        if msg.id not in msgs:
+            msgs.append(msg.id)
+        return msg
+
+    async def _scratch_clear(self, session):
+        """Delete the recorded one-off hints (safe to call twice)."""
+        ids = session.get("scratch_msgs") or []
+        if not ids:
+            return
+        session["scratch_msgs"] = []
+        chat_id = session.get("chat_id")
+        if not chat_id:
+            return
+        for i in range(0, len(ids), 100):
+            try:
+                await self.bot.delete_messages(chat_id, ids[i : i + 100])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "urldl hint cleanup failed: {}: {}",
+                    type(exc).__name__,
+                    exc,
+                )
+
     async def _begin(self, token):
         """Start the download task for a session (idempotent)."""
         session = self.sessions.get(token)
@@ -2641,6 +2693,7 @@ class UrlDownloader:
             self.pending_select.pop(user_id, None)
             self.pending_conflict.pop(user_id, None)
             await self._edit_status(session, text)
+            await self._scratch_clear(session)
             self.sessions.pop(token, None)
             self.status_edit_locks.pop(token, None)
             self.status_body.pop(token, None)
@@ -2961,6 +3014,9 @@ class UrlDownloader:
             self.progress_cache.pop(token, None)
             self.status_body.pop(token, None)
             shutil.rmtree(os.path.join(self.tmp_root, token), ignore_errors=True)
+            # 删除任务期间的一次性提示（如“已自动并入新文件”），
+            # 聊天里只留最终结果卡
+            await self._scratch_clear(session)
             # 下载期间晚到的媒体：本批成功后自动接续下载，不丢文件
             strays = (
                 list(session.get("strays") or [])
