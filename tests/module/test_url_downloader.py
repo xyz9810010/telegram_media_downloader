@@ -488,7 +488,13 @@ class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
         }
 
     async def test_late_media_after_window_merges_into_visible_batch(self):
+        import module.url_downloader as url_mod
+
+        old_secs = url_mod._BATCH_REDRAW_SECS
+        url_mod._BATCH_REDRAW_SECS = 0.05
+        self.addCleanup(setattr, url_mod, "_BATCH_REDRAW_SECS", old_secs)
         downloader = UrlDownloader()
+        downloader.app = SimpleNamespace(loop=asyncio.get_running_loop())
         client = _RecordingClient()
         session = self._base_session(9)
         token = session["token"]
@@ -497,6 +503,8 @@ class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
         downloader.pending_folder[self.USER] = token
 
         await downloader._media_message_locked(client, self._photo(10))
+        # 卡片/提示刷新是合并延迟的（防限流），稍等它发出
+        await asyncio.sleep(0.12)
 
         self.assertEqual(10, len(session["media_msgs"]))
         self.assertTrue(any(m.id == 10 for m in session["media_msgs"]))
@@ -508,7 +516,13 @@ class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(client.sent))
 
     async def test_single_file_session_reopens_to_batch_on_late_media(self):
+        import module.url_downloader as url_mod
+
+        old_secs = url_mod._BATCH_REDRAW_SECS
+        url_mod._BATCH_REDRAW_SECS = 0.05
+        self.addCleanup(setattr, url_mod, "_BATCH_REDRAW_SECS", old_secs)
         downloader = UrlDownloader()
+        downloader.app = SimpleNamespace(loop=asyncio.get_running_loop())
         client = _RecordingClient()
         m0 = self._photo(5)
         session = {
@@ -529,6 +543,7 @@ class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
         downloader.sessions["single-token"] = session
 
         await downloader._media_message_locked(client, self._photo(6))
+        await asyncio.sleep(0.12)
 
         self.assertTrue(session["multi"])
         self.assertEqual([5, 6], [m.id for m in session["media_msgs"]])
@@ -872,7 +887,13 @@ class UrlDownloaderScratchCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(self.CHAT, [501])], bot.deleted)
 
     async def test_auto_merge_notices_are_deleted_when_task_ends(self):
+        import module.url_downloader as url_mod
+
+        old_secs = url_mod._BATCH_REDRAW_SECS
+        url_mod._BATCH_REDRAW_SECS = 0.05
+        self.addCleanup(setattr, url_mod, "_BATCH_REDRAW_SECS", old_secs)
         downloader = UrlDownloader()
+        downloader.app = SimpleNamespace(loop=asyncio.get_running_loop())
         bot = _ScratchDeleteBot()
         downloader.bot = bot
         client = _ScratchClient()
@@ -892,27 +913,25 @@ class UrlDownloaderScratchCleanupTest(unittest.IsolatedAsyncioTestCase):
         downloader.sessions["t2"] = session
         downloader.pending_folder[self.USER] = "t2"
 
-        # 文件夹卡已弹出时又并入一个文件 -> 连续提示只留最新一条：
-        # 第二条发出前会自动删掉第一条
+        # 文件夹卡已弹出时又并入两个文件：4 秒内的多次并入合并成
+        # 一次刷新（防限流），提示只发一条且数量是最新的
         session["media_msgs"] = [m1, m2, self._photo(3)]
         await downloader._refresh_question_card(client, session)
         session["media_msgs"] = [m1, m2, self._photo(3), self._photo(4)]
         await downloader._refresh_question_card(client, session)
+        await asyncio.sleep(0.12)
 
-        self.assertEqual(2, len(client.sent))
+        self.assertEqual(1, len(client.sent))
         self.assertTrue(
             client.sent[0][1].startswith("➕ 已自动并入新到的文件")
         )
-        # 第一条(501)已被第二条发出前的清理删除，记录里只剩最新(502)
-        self.assertEqual([(self.CHAT, [501])], bot.deleted)
-        self.assertEqual([502], session["scratch_msgs"])
+        self.assertIn("这批现在共 4 个", client.sent[0][1])
+        self.assertEqual([501], session["scratch_msgs"])
 
         # 任务结束（无论成功/取消）都会走到统一清理
         await downloader._scratch_clear(session)
 
-        self.assertEqual(
-            [(self.CHAT, [501]), (self.CHAT, [502])], bot.deleted
-        )
+        self.assertEqual([(self.CHAT, [501])], bot.deleted)
         self.assertEqual([], session["scratch_msgs"])
 
     async def test_failed_delete_is_retried_by_next_cleanup(self):
@@ -983,3 +1002,113 @@ class UrlDownloaderScratchCleanupTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UrlDownloaderBatchMergeTest(unittest.IsolatedAsyncioTestCase):
+    """大转发场景：自动接续要真正启动；卡片刷新要合并防限流。"""
+
+    USER = 777
+    CHAT = -100
+
+    def _photo(self, mid):
+        media = SimpleNamespace(
+            value="photo", file_name=None, file_size=8
+        )
+        m = SimpleNamespace(
+            id=mid,
+            from_user=SimpleNamespace(id=self.USER),
+            chat=SimpleNamespace(id=self.CHAT),
+            media=media,
+        )
+        m.photo = media
+        return m
+
+    def _downloader(self):
+        downloader = UrlDownloader()
+        downloader.app = SimpleNamespace(loop=asyncio.get_running_loop())
+        return downloader
+
+    async def test_auto_continue_actually_starts_new_task(self):
+        downloader = self._downloader()
+        started = []
+
+        async def fake_begin(token):
+            started.append(token)
+
+        downloader._begin = fake_begin  # type: ignore[method-assign]
+        strays = [self._photo(3), self._photo(1), self._photo(2)]
+        old_session = {
+            "token": "done1",
+            "user_id": self.USER,
+            "chat_id": self.CHAT,
+            "folder": "旅行",
+        }
+
+        await downloader._continue_stray_download(old_session, strays)
+
+        # 曾漏 await 导致接续任务永远不启动：这里必须真正调用 _begin
+        self.assertEqual(1, len(started))
+        token = started[0]
+        new_session = downloader.sessions[token]
+        self.assertEqual(
+            [1, 2, 3], [m.id for m in new_session["media_msgs"]]
+        )
+        self.assertEqual("旅行", new_session["folder"])
+
+    async def test_card_redraw_is_merged_while_burst_is_arriving(self):
+        import module.url_downloader as url_mod
+
+        old_secs = url_mod._BATCH_REDRAW_SECS
+        url_mod._BATCH_REDRAW_SECS = 0.05
+        self.addCleanup(setattr, url_mod, "_BATCH_REDRAW_SECS", old_secs)
+        downloader = self._downloader()
+        redraws = []
+
+        async def fake_show(client, token):
+            redraws.append(token)
+
+        downloader._show_item_select = fake_show  # type: ignore[method-assign]
+        m1 = self._photo(1)
+        session = {
+            "token": "burst",
+            "user_id": self.USER,
+            "chat_id": self.CHAT,
+            "kind": "tg",
+            "multi": True,
+            "media_msgs": [m1],
+            "started": False,
+            "folder": "",
+        }
+        downloader.sessions["burst"] = session
+        downloader.pending_select[self.USER] = "burst"
+
+        # 一秒内陆续并入多个文件：只应排队一次合并刷新
+        for i in range(2, 8):
+            session["media_msgs"] = [m1] + [self._photo(j) for j in range(2, i + 1)]
+            await downloader._refresh_question_card(
+                SimpleNamespace(), session
+            )
+        self.assertEqual(1, len(downloader._redraw_tasks))
+
+        await asyncio.sleep(0.12)
+
+        self.assertEqual(["burst"], redraws)
+
+        # 之后又来一批：可以再次刷新（最终计数以最新为准）
+        await downloader._refresh_question_card(SimpleNamespace(), session)
+        self.assertEqual(1, len(downloader._redraw_tasks))
+        await asyncio.sleep(0.12)
+        self.assertEqual(2, len(redraws))
+
+    async def test_hint_skipped_while_flood_cooling(self):
+        downloader = self._downloader()
+        downloader.bot = _ScratchDeleteBot()
+        client = _ScratchClient()
+        session = {"token": "t5", "chat_id": self.CHAT}
+        downloader.flood_until[self.CHAT] = time.monotonic() + 60
+
+        msg = await downloader._scratch_send(client, session, "➕ 冷却中")
+
+        self.assertIsNone(msg)
+        self.assertEqual([], client.sent)
+        self.assertIsNone(session.get("scratch_msgs"))

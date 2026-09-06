@@ -63,6 +63,7 @@ _RENAME_WORDS = {
 
 _QUALITY_EXPIRE_SECS = 15 * 60
 _MEDIA_COLLECT_SECS = 2.2
+_BATCH_REDRAW_SECS = 4.0
 _FOLDER_NAME_WAIT_SECS = 5 * 60
 _CONFLICT_WAIT_SECS = 60
 # 勾选清单卡片：文本最多列出的条目数 / 单项按钮上限（Telegram 单条
@@ -362,6 +363,7 @@ class UrlDownloader:
         self.pending_conflict = {}
         self.timers = {}
         self.run_tasks = {}
+        self._redraw_tasks = {}
         self.cancel_events = {}
         self.cancel_watch_tasks = {}
         self.cancel_results = {}
@@ -452,6 +454,10 @@ class UrlDownloader:
             if task and not task.done():
                 task.cancel()
         self.run_tasks.clear()
+        for task in self._redraw_tasks.values():
+            if task and not task.done():
+                task.cancel()
+        self._redraw_tasks.clear()
         self.sessions.clear()
         self.pending_name.clear()
         self.pending_quality.clear()
@@ -1460,29 +1466,86 @@ class UrlDownloader:
         return True
 
     async def _refresh_question_card(self, client, session):
-        """Update the visible question card after a late media joined the batch."""
+        """Schedule the question card update after a late media joined.
+
+        Forwarding a big burst can deliver a file every second; redrawing the
+        whole checklist card on each arrival would blow past Telegram's
+        ~20 messages/minute chat limit and stall every status update with a
+        FloodWait. Updates are therefore merged: at most one refresh runs per
+        _BATCH_REDRAW_SECS, and it reads the newest batch state, so the card
+        always ends up showing the final count.
+        """
         token = session.get("token")
         user_id = session.get("user_id")
+        if not token or not user_id:
+            return
+        existing = self._redraw_tasks.get(token)
+        if existing is not None and not existing.done():
+            return  # 已有一个合并刷新在排队，最终会读到最新状态
+        loop = getattr(getattr(self, "app", None), "loop", None)
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.warning(
+                    "urldl card redraw skipped token={}: no running loop",
+                    token,
+                )
+                return
+        self._redraw_tasks[token] = loop.create_task(
+            self._redraw_batch_card(client, token, user_id)
+        )
+
+    async def _redraw_batch_card(self, client, token, user_id):
+        """One merged redraw: latest batch state, or a short hint when the
+        user is still on the folder picker."""
+        try:
+            await asyncio.sleep(_BATCH_REDRAW_SECS)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._redraw_tasks.pop(token, None)
+        session = self.sessions.get(token)
+        if (
+            session is None
+            or session.get("started")
+            or session.get("start_pending")
+            or session.get("user_id") != user_id
+        ):
+            return
         n = len(session.get("media_msgs") or [])
-        if self.pending_select.get(user_id) == token:
-            # 多选清单卡：重画，让新文件出现在勾选列表里
-            await self._show_item_select(client, token)
-            return
-        if self.pending_name.get(user_id) == token:
-            # 命名卡：重画（批量时文案会带新数量/统一命名说明）
-            await self._prompt_name(client, token)
-            return
-        if self.pending_folder.get(user_id) == token and session.get("at_picker"):
-            # 文件夹卡：不重列 NAS（避免打断导航），补一条提示即可
-            # 一次性提示：任务收尾时自动删除
-            await self._scratch_send(
-                client,
-                session,
-                f"➕ 已自动并入新到的文件：这批现在共 {n} 个，"
-                "继续在下方卡片选文件夹后即可一起下载。",
+        try:
+            # 与按钮回调串行，避免两张卡互相覆盖
+            async with self._user_lock(user_id):
+                if self.pending_select.get(user_id) == token:
+                    # 多选清单卡：重画，让新文件出现在勾选列表里
+                    await self._show_item_select(client, token)
+                elif self.pending_name.get(user_id) == token:
+                    # 命名卡：重画（批量时文案会带新数量/统一命名说明）
+                    await self._prompt_name(client, token)
+                elif (
+                    self.pending_folder.get(user_id) == token
+                    and session.get("at_picker")
+                ):
+                    # 文件夹卡：不重列 NAS（避免打断导航），补一条提示即可
+                    # 一次性提示：任务收尾时自动删除
+                    await self._scratch_send(
+                        client,
+                        session,
+                        f"➕ 已自动并入新到的文件：这批现在共 {n} 个，"
+                        "继续在下方卡片选文件夹后即可一起下载。",
+                    )
+                else:
+                    logger.info(
+                        f"urldl late media merged during quiet stage of {token}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "urldl card redraw failed token={}: {}: {}",
+                token,
+                type(exc).__name__,
+                exc,
             )
-            return
-        logger.info(f"urldl late media merged during quiet stage of {token}")
 
     def _restart_media_collect(self, client, token=None, session=None):
         """(Re)start the short window that gathers forwarded media together."""
@@ -2442,6 +2505,9 @@ class UrlDownloader:
         chat_id = chat_id or session.get("chat_id")
         if not chat_id:
             return None
+        # 限流冷却中不再尝试：提示不是关键消息，跳过即可
+        if self._flood_left(chat_id):
+            return None
         await self._scratch_clear(session)
         try:
             msg = await client.send_message(chat_id, text)
@@ -3083,7 +3149,7 @@ class UrlDownloader:
             logger.info(
                 f"urldl auto-continue {token}: {len(msgs)} strays for {user_id}"
             )
-            self._begin(token)
+            await self._begin(token)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"urldl auto-continue failed: {exc}")
 
