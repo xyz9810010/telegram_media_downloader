@@ -1315,16 +1315,34 @@ class UrlDownloader:
         session = self._find_user_session(user_id)
         if session is not None and session.get("collecting"):
             # 还在收集窗口内：追加，并重置等待计时（等最后一条到了再开始问）
-            msgs = session.setdefault("media_msgs", [])
-            if message.id not in [m.id for m in msgs]:
-                msgs.append(message)
-                session["size"] = (session.get("size") or 0) + size
+            if self._batch_append(session, message, size):
                 self._restart_media_collect(client, token=None, session=session)
             return
         if session is not None:
+            token = session.get("token")
+            started = bool(session.get("started") or session.get("start_pending"))
+            if session.get("kind") == "tg" and not started:
+                # 收集窗口已关闭、但下载还没开始：晚到的媒体（转发时最后
+                # 几张经常比前几张晚到好几秒）并进当前这批，不丢弃
+                if self._batch_append(session, message, size):
+                    await self._refresh_question_card(client, session)
+                return
+            if session.get("kind") == "tg":
+                # 已经开始下载：先记下来，本批成功后自动接续下载到同一文件夹
+                if self._stray_append(session, message, size):
+                    if not self._busy_notice(user_id):
+                        n = len(session.get("media_msgs") or []) + len(
+                            session.get("strays") or []
+                        )
+                        await client.send_message(
+                            message.chat.id,
+                            f"📌 收到新文件（本批共 {n} 张）：已自动记录，"
+                            "本批结束后会自动接着下载到同一文件夹，不用再转发。",
+                        )
+                return
             logger.warning(
                 f"urldl busy media {user_id}: "
-                f"token={session.get('token')} started={session.get('started')}"
+                f"token={token} started={session.get('started')}"
             )
             if not self._busy_notice(user_id):
                 if session.get("started"):
@@ -1370,6 +1388,72 @@ class UrlDownloader:
             "media_group_id": getattr(message, "media_group_id", None),
         }
         self._restart_media_collect(client, token=token)
+
+    def _batch_append(self, session, message, size):
+        """Append one media message to a tg batch (dedupe by message id)."""
+        msgs = session.get("media_msgs")
+        if not msgs:
+            # 收集窗口对单文件批次结束时会清空 media_msgs，只留 tg_msg
+            m0 = session.get("tg_msg")
+            msgs = session["media_msgs"] = [m0] if m0 is not None else []
+        if any(m.id == message.id for m in msgs):
+            return False
+        msgs.append(message)
+        session["size"] = (session.get("size") or 0) + size
+        sel = session.get("selected")
+        if isinstance(sel, list):
+            sel.append(True)
+        if len(msgs) > 1:
+            session["multi"] = True
+            session["title"] = "批量媒体"
+        logger.info(
+            f"urldl late media merged into {session.get('token')}: "
+            f"batch now {len(msgs)}"
+        )
+        return True
+
+    def _stray_append(self, session, message, size):
+        """Stash media that arrived while the batch was already downloading."""
+        seen = {m.id for m in (session.get("strays") or [])}
+        seen.update(m.id for m in (session.get("media_msgs") or []))
+        tg_msg = session.get("tg_msg")
+        if tg_msg is not None:
+            seen.add(tg_msg.id)
+        if message.id in seen:
+            return False
+        session.setdefault("strays", []).append(message)
+        session["stray_size"] = (session.get("stray_size") or 0) + size
+        logger.info(
+            f"urldl stray media stashed {session.get('token')}: "
+            f"strays now {len(session['strays'])}"
+        )
+        return True
+
+    async def _refresh_question_card(self, client, session):
+        """Update the visible question card after a late media joined the batch."""
+        token = session.get("token")
+        user_id = session.get("user_id")
+        n = len(session.get("media_msgs") or [])
+        if self.pending_select.get(user_id) == token:
+            # 多选清单卡：重画，让新文件出现在勾选列表里
+            await self._show_item_select(client, token)
+            return
+        if self.pending_name.get(user_id) == token:
+            # 命名卡：重画（批量时文案会带新数量/统一命名说明）
+            await self._prompt_name(client, token)
+            return
+        if self.pending_folder.get(user_id) == token and session.get("at_picker"):
+            # 文件夹卡：不重列 NAS（避免打断导航），补一条提示即可
+            try:
+                await client.send_message(
+                    session.get("chat_id"),
+                    f"➕ 已自动并入新到的文件：这批现在共 {n} 个，"
+                    "继续在下方卡片选文件夹后即可一起下载。",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"urldl batch-update note failed: {exc}")
+            return
+        logger.info(f"urldl late media merged during quiet stage of {token}")
 
     def _restart_media_collect(self, client, token=None, session=None):
         """(Re)start the short window that gathers forwarded media together."""
@@ -2669,6 +2753,7 @@ class UrlDownloader:
         queue_msg = None
         prompt = session.get("status_msg")
         acquired = False
+        finished_ok = False
         try:
             if sem.locked():
                 try:
@@ -2737,6 +2822,7 @@ class UrlDownloader:
             try:
                 if session.get("multi"):
                     await self._download_multi(token, session, event)
+                    finished_ok = True
                     return
                 if not await self._preflight_conflict(token, session, event):
                     return
@@ -2783,6 +2869,7 @@ class UrlDownloader:
                 text = f"✅ 已保存到 NAS：\n`{nas}`\n大小：{_format_size(size)}"
                 await self._edit_status(session, text)
                 self._record_cancel_saved(token)
+                finished_ok = True
             except asyncio.CancelledError:
                 raise
             except _ConflictCancelled:
@@ -2824,12 +2911,18 @@ class UrlDownloader:
             if acquired:
                 sem.release()
             logger.info(f"run_task end {token}")
-            self.pending_name.pop(user_id, None)
-            self.pending_quality.pop(user_id, None)
-            self.pending_custom.pop(user_id, None)
-            self.pending_folder.pop(user_id, None)
-            self.pending_select.pop(user_id, None)
-            self.pending_conflict.pop(user_id, None)
+            # 只清理仍指向本任务的待处理状态，避免误删自动接续期间
+            # 用户新起的另一个任务正在等待的卡片状态
+            for _pending in (
+                self.pending_name,
+                self.pending_quality,
+                self.pending_custom,
+                self.pending_folder,
+                self.pending_select,
+                self.pending_conflict,
+            ):
+                if _pending.get(user_id) == token:
+                    _pending.pop(user_id, None)
             self.cancel_events.pop(token, None)
             if (
                 token in self.cancel_results
@@ -2839,8 +2932,61 @@ class UrlDownloader:
             self.progress_cache.pop(token, None)
             self.status_body.pop(token, None)
             shutil.rmtree(os.path.join(self.tmp_root, token), ignore_errors=True)
+            # 下载期间晚到的媒体：本批成功后自动接续下载，不丢文件
+            strays = (
+                list(session.get("strays") or [])
+                if (finished_ok and session is not None)
+                else []
+            )
             self.sessions.pop(token, None)
             self.status_edit_locks.pop(token, None)
+            if strays:
+                self.app.loop.create_task(
+                    self._continue_stray_download(session, strays)
+                )
+
+    async def _continue_stray_download(self, session, strays):
+        """Auto-download media that arrived while the batch was running.
+
+        Reuses the folder of the finished batch so late-forwarded files land
+        in the same place without another round of questions. Runs through
+        the normal per-user/semaphore path, so it can still be cancelled.
+        """
+        try:
+            msgs = [m for m in strays if getattr(m, "media", None)]
+            if not msgs:
+                return
+            user_id = session.get("user_id")
+            chat_id = session.get("chat_id")
+            if not user_id or not chat_id:
+                return
+            msgs.sort(key=lambda m: m.id)
+            token = f"{random.randrange(16 ** 8):08x}"
+            size = 0
+            for m in msgs:
+                md = getattr(m, m.media.value, None)
+                size += getattr(md, "file_size", 0) or 0
+            self.sessions[token] = {
+                "token": token,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "url": "",
+                "kind": "tg",
+                "tg_msg": msgs[0],
+                "title": "批量媒体",
+                "size": size,
+                "next_stage": "name",
+                "collecting": False,
+                "multi": True,
+                "media_msgs": msgs,
+                "folder": session.get("folder") or "",
+            }
+            logger.info(
+                f"urldl auto-continue {token}: {len(msgs)} strays for {user_id}"
+            )
+            self._begin(token)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"urldl auto-continue failed: {exc}")
 
     async def _resolve_conflict(self, token, session, event, local_path):
         """Ask again (safety net) when the NAS file still collides by name."""

@@ -431,5 +431,134 @@ class UrlDownloaderProgressTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, bot.sends)
 
 
+class _RecordingClient:
+    """Minimal chat stand-in that records sent note texts."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        del chat_id, kwargs
+        self.sent.append(text)
+        return SimpleNamespace(id=len(self.sent))
+
+
+class UrlDownloaderMediaBatchTest(unittest.IsolatedAsyncioTestCase):
+    """Late-arriving media of a forwarded burst must not be dropped.
+
+    Regression: forwarding ~10 photos delivers the last one several seconds
+    after the first nine, i.e. after the 2.2s collect window has closed.
+    """
+
+    USER = 7487373928
+    CHAT = -1004456246045
+
+    @classmethod
+    def _photo(cls, message_id):
+        media = SimpleNamespace(value="photo", file_name=None, file_size=2048)
+        message = SimpleNamespace(
+            id=message_id,
+            from_user=SimpleNamespace(id=cls.USER),
+            chat=SimpleNamespace(id=cls.CHAT),
+            media=media,
+        )
+        message.photo = media
+        return message
+
+    def _base_session(self, n, started=False):
+        msgs = [self._photo(i) for i in range(1, n + 1)]
+        return {
+            "token": "batch-token",
+            "user_id": self.USER,
+            "chat_id": self.CHAT,
+            "url": "",
+            "kind": "tg",
+            "tg_msg": msgs[0],
+            "title": "批量媒体",
+            "size": 0,
+            "next_stage": "name",
+            "collecting": False,
+            "multi": True,
+            "media_msgs": msgs,
+            "folder": "旅行",
+            "started": started,
+        }
+
+    async def test_late_media_after_window_merges_into_visible_batch(self):
+        downloader = UrlDownloader()
+        client = _RecordingClient()
+        session = self._base_session(9)
+        token = session["token"]
+        downloader.sessions[token] = session
+        session["at_picker"] = True
+        downloader.pending_folder[self.USER] = token
+
+        await downloader._media_message_locked(client, self._photo(10))
+
+        self.assertEqual(10, len(session["media_msgs"]))
+        self.assertTrue(any(m.id == 10 for m in session["media_msgs"]))
+        self.assertEqual(1, len(client.sent))
+        self.assertIn("自动并入", client.sent[0])
+        # 同一条消息重复投递只算一次，不重复提示
+        await downloader._media_message_locked(client, self._photo(10))
+        self.assertEqual(10, len(session["media_msgs"]))
+        self.assertEqual(1, len(client.sent))
+
+    async def test_single_file_session_reopens_to_batch_on_late_media(self):
+        downloader = UrlDownloader()
+        client = _RecordingClient()
+        m0 = self._photo(5)
+        session = {
+            "token": "single-token",
+            "user_id": self.USER,
+            "chat_id": self.CHAT,
+            "url": "",
+            "kind": "tg",
+            "tg_msg": m0,
+            "title": "图片",
+            "size": 2048,
+            "next_stage": "name",
+            "collecting": False,
+            "multi": False,
+            "media_msgs": None,  # 单文件窗口结束后列表会被清空
+            "folder": "",
+        }
+        downloader.sessions["single-token"] = session
+
+        await downloader._media_message_locked(client, self._photo(6))
+
+        self.assertTrue(session["multi"])
+        self.assertEqual([5, 6], [m.id for m in session["media_msgs"]])
+
+    async def test_media_during_running_download_is_stashed_for_continue(self):
+        downloader = UrlDownloader()
+        client = _RecordingClient()
+        session = self._base_session(9, started=True)
+        downloader.sessions[session["token"]] = session
+
+        await downloader._media_message_locked(client, self._photo(10))
+        await downloader._media_message_locked(client, self._photo(11))
+        await downloader._media_message_locked(client, self._photo(10))
+
+        self.assertEqual([10, 11], [m.id for m in session["strays"]])
+        # 第一条附带提示，随后 5 秒内被限流抑制，避免刷屏
+        self.assertEqual(1, len(client.sent))
+        self.assertIn("自动记录", client.sent[0])
+
+    async def test_stray_continue_reuses_folder_and_starts_download(self):
+        downloader = UrlDownloader()
+        started = []
+        downloader._begin = lambda tk: started.append(tk)  # type: ignore[method-assign]
+        session = self._base_session(9, started=True)
+
+        await downloader._continue_stray_download(session, [self._photo(10)])
+
+        self.assertEqual(1, len(started))
+        new_session = downloader.sessions[started[0]]
+        self.assertEqual(session["folder"], new_session["folder"])
+        self.assertEqual([10], [m.id for m in new_session["media_msgs"]])
+        self.assertTrue(new_session["multi"])
+
+
 if __name__ == "__main__":
     unittest.main()
